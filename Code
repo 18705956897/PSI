@@ -833,7 +833,7 @@ class PSIGUI:
 
         # Create main window
         self.fig = plt.figure(figsize=(16, 12))
-        self.fig.canvas.manager.set_window_title("Pixel Segmenting Imaging (PSI) System")
+        self.fig.canvas.manager.set_window_title("Pixel-segmenting Imaging (PSI) System")
 
         # Create subplots with proper spacing using gridspec
         gs = self.fig.add_gridspec(10, 8, hspace=0.3, wspace=0.3)
@@ -1061,7 +1061,7 @@ class PSIGUI:
 
 # -------------------------- Main Program Entry --------------------------
 if __name__ == "__main__":
-    print("Pixel Segmenting Imaging (PSI) System starting...")
+    print("Pixel-segmenting Imaging (PSI) System starting...")
     print(f"PyTorch version: {torch.__version__}")
 
     warnings.filterwarnings('ignore')
