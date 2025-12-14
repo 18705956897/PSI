@@ -1,1070 +1,1213 @@
-import torch
-import torch.nn.functional as F
 import numpy as np
-import os
-import matplotlib.pyplot as plt
-from PIL import Image
-from matplotlib.widgets import Button, RectangleSelector
-import time
-import math
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, ttk, simpledialog
+from PIL import Image
+import os
+import glob
 import re
-import warnings
+import time
+from scipy.optimize import basinhopping, minimize, lsq_linear, least_squares
+from scipy.sparse.linalg import lsqr
+from scipy.io import loadmat
+from skimage.feature import match_template
+from skimage.transform import rescale, rotate, resize
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.widgets import RectangleSelector
+from skimage.filters import gaussian
+from tkinter import messagebox
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+QE_FILE_PATH = r'D\QE.npz'
+QE_DATA = None
 
 
-# -------------------------- Global Configuration Class --------------------------
-class Config:
-    def __init__(self):
-        # Path and file configuration
-        self.img_folder = ""
-        self.qe_data_path = "QE Distribution Data.npz"
-        self.result_save_path = ""
-
-        # Reconstruction parameters
-        self.sr_factor = 4  # 2/3/4x pixel segmentation
-        self.start_num = 1
-        self.end_num = 16
-        self.ref_frame_idx = 6  # Reference frame index
-        self.roi = [0, 0, 320, 256]  # [x, y, w, h]
-
-        # Evolutionary algorithm parameters
-        self.pop_size = 100
-        self.max_iter = 100
-        self.CR = 0.9
-        self.F = 0.5
-        self.stride = 0.1
-
-        # Post-processing parameters
-        self.border_threshold = 1  # Border clipping switch (1=enabled)
-        self.gaussian_filter = 0
-        self.gs_sigma = 1.0
-        self.fgs_sigma = 0.75
-
-        # Status information
-        self.status = "Ready: Please load image data"
-        self.processing_time = 0.0
+def CCR_NC2(a1, a2):
+    a1 = np.asarray(a1, dtype=np.float64)
+    a2 = np.asarray(a2, dtype=np.float64)
+    k = match_template(a2, a1, pad_input=True)
+    max_corr = np.max(k)
+    y_peak, x_peak = np.unravel_index(np.argmax(k), k.shape)
+    offset_y = y_peak - a1.shape[0] + 1
+    offset_x = x_peak - a1.shape[1] + 1
+    return np.array([max_corr, 0, 0, offset_x, offset_y])
 
 
-# Initialize configuration
-config = Config()
+def sort_nat(c):
+    def convert(text): return int(text) if text.isdigit() else text.lower()
+
+    def alphanum_key(key): return [convert(c) for c in re.split('(\d+)', key)]
+
+    return sorted(c, key=alphanum_key)
 
 
-# -------------------------- Data Processing Utility Class --------------------------
-class DataProcessor:
-    @staticmethod
-    def load_image(path, normalize=False):
-        """Load image and convert to PyTorch tensor"""
-        try:
-            img = Image.open(path).convert('L')  # Convert to grayscale
-            img_tensor = torch.tensor(np.array(img), dtype=torch.float32)
-            if normalize:
-                img_tensor = (img_tensor - img_tensor.min()) / (img_tensor.max() - img_tensor.min() + 1e-8)
-            return img_tensor
-        except Exception as e:
-            print(f"Image loading failed: {e}")
-            return None
-
-    @staticmethod
-    def save_image(tensor, path, dtype=np.uint16):
-        """Save tensor as image file"""
-        try:
-            img_np = tensor.numpy().astype(dtype)
-            Image.fromarray(img_np).save(path)
-            return True
-        except Exception as e:
-            print(f"Image saving failed: {e}")
-            return False
-
-    @staticmethod
-    def crop_image(img, roi):
-        """Crop ROI region [x, y, w, h]"""
-        x, y, w, h = roi
-        h_max, w_max = img.shape[-2], img.shape[-1]
-        x = max(0, min(x, w_max - 1))
-        y = max(0, min(y, h_max - 1))
-        w = min(w, w_max - x)
-        h = min(h, h_max - y)
-        return img[..., y:y + h, x:x + w]
-
-    @staticmethod
-    def resize_image(img, scale_factor, mode='bilinear'):
-        """Resize image"""
-        if img.ndim == 2:
-            img = img.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-        elif img.ndim == 3:
-            img = img.unsqueeze(0)  # [1, C, H, W]
-        resized = F.interpolate(
-            img,
-            scale_factor=scale_factor,
-            mode=mode,
-            align_corners=True
-        )
-        return resized.squeeze()
-
-    @staticmethod
-    def natural_sort(lst):
-        """Natural sorting (numbers sorted by value)"""
-
-        def convert(text):
-            return int(text) if text.isdigit() else text.lower()
-
-        def alphanum_key(key):
-            return [convert(c) for c in re.split('([0-9]+)', str(key))]
-
-        return sorted(lst, key=alphanum_key)
+def imread_tif(filepath):
+    try:
+        img = Image.open(filepath)
+        return np.asarray(img, dtype=np.float64)
+    except Exception as e:
+        print(f"Error reading image {filepath}: {e}")
+        return None
 
 
-# -------------------------- QE Data Handling Class --------------------------
-class QEDataHandler:
-    def __init__(self):
-        self.qe_brightness = {}  # Brightness component {scale_factor: data}
-        self.qe_contrast = {}  # Contrast component {scale_factor: data}
-        self.loaded = False
+def imcrop_np(img, crop_rect):
+    xmin, ymin, width, height = [int(x) for x in crop_rect]
+    ymin_idx = ymin - 1
+    ymax_idx = ymin - 1 + height
+    xmin_idx = xmin - 1
+    xmax_idx = xmin - 1 + width
+    rows, cols = img.shape
+    ymin_idx = max(0, ymin_idx)
+    ymax_idx = min(rows, ymax_idx)
+    xmin_idx = max(0, xmin_idx)
+    xmax_idx = min(cols, xmax_idx)
 
-    def load_qe_data(self):
-        """Load QE distribution data"""
-        try:
-            if not os.path.exists(config.qe_data_path):
-                print(f"QE data file not found: {config.qe_data_path}, generating simulated data")
-                self.generate_simulated_qe_data()
+    if ymin_idx >= ymax_idx or xmin_idx >= xmax_idx:
+        return np.array([])
+    return img[ymin_idx:ymax_idx, xmin_idx:xmax_idx]
+
+
+def imgMovementFind(ccr, file_names, imgRefIndex, range_val, imgCrop, flag):
+    x = ccr[:, 3]
+    y = ccr[:, 4]
+    imgRefIndex_0based = imgRefIndex - 1
+    xmin = np.round(np.min(x))
+    xmax = np.round(np.max(x))
+    index_list = []
+    fileIndex = []
+
+    for i in range(int(xmin - x[imgRefIndex_0based]), int(xmax - x[imgRefIndex_0based]) + 1):
+        xtemp = x[imgRefIndex_0based] + i
+        xpos = np.abs(x - xtemp) <= range_val
+        findexI = np.where(xpos)[0]
+
+        yy = y[findexI]
+        ypos = np.abs((yy - y[imgRefIndex_0based]) - np.round(yy - y[imgRefIndex_0based])) <= range_val
+        findexI_y = findexI[ypos]
+        yy1 = yy[ypos]
+
+        if yy1.size == 0:
+            continue
+
+        min_yy_diff = int(np.min(yy1 - y[imgRefIndex_0based]))
+        max_yy_diff = int(np.max(yy1 - y[imgRefIndex_0based]))
+
+        for j in range(min_yy_diff - 1, max_yy_diff + 2):
+            ytemp = y[imgRefIndex_0based] + j
+            ypos_final = np.abs(yy1 - ytemp) <= range_val
+            findex = findexI_y[ypos_final]
+
+            if len(findex) > 0:
+                div = np.sqrt((x[findex] - xtemp) ** 2 + (y[findex] - ytemp) ** 2)
+                pos = np.argmin(div)
+                index_list.append(
+                    [findex[pos] + 1, float(i), float(j), x[findex[pos]], y[findex[pos]], ccr[findex[pos], 0]])
+                if flag == 1:
+                    fileIndex.append(file_names[findex[pos]])
+
+    index = np.array(index_list, dtype=np.float64)
+    result = {'index': index, 'range': range_val}
+    Img = {'imgRef': None, 'imgMean': None, 'img': None}
+
+    if flag == 1 and index.size > 0:
+        img_list = []
+        crop_w, crop_h = imgCrop[2], imgCrop[3]
+
+        for i, file_name in enumerate(fileIndex):
+            temp = imread_tif(file_name)
+            if temp is None: continue
+            new_crop_rect = imgCrop.copy()
+            new_crop_rect[0] += int(index[i, 1])
+            new_crop_rect[1] += int(index[i, 2])
+            try:
+                cropped_img = imcrop_np(temp, new_crop_rect)
+                if cropped_img.size > 0 and cropped_img.shape == (crop_h, crop_w):
+                    img_list.append(cropped_img)
+            except Exception as e:
+                print(f"Error during image cropping for {file_name}: {e}")
+
+        img_array = np.stack(img_list, axis=2) if img_list else np.array([])
+
+        if img_array.size > 0:
+            pos_ref = np.where(index[:, 0] == imgRefIndex)[0]
+            if len(pos_ref) > 0:
+                pos_ref = pos_ref[0]
+                Img['img'] = img_array
+                Img['imgMean'] = np.mean(img_array, axis=2)
+                Img['imgRef'] = img_array[:, :, pos_ref]
+                ccr_mean = CCR_NC2(Img['imgRef'], Img['imgMean'])
+                result['ccr'] = ccr_mean[0]
             else:
-                data = np.load(config.qe_data_path, allow_pickle=True)
-                self.qe_brightness[4] = torch.tensor(data['brightness_4x'], dtype=torch.float32)
-                self.qe_contrast[4] = torch.tensor(data['contrast_4x'], dtype=torch.float32)
-                self.qe_brightness[3] = torch.tensor(data['brightness_3x'], dtype=torch.float32)
-                self.qe_contrast[3] = torch.tensor(data['contrast_3x'], dtype=torch.float32)
-                self.qe_brightness[2] = torch.tensor(data['brightness_2x'], dtype=torch.float32)
-                self.qe_contrast[2] = torch.tensor(data['contrast_2x'], dtype=torch.float32)
-            self.loaded = True
-            return True
-        except Exception as e:
-            print(f"QE data loading failed: {e}, generating simulated data")
-            self.generate_simulated_qe_data()
-            self.loaded = True
-            return True
+                Img['img'] = np.array([])
+                result['ccr'] = 0.0
 
-    def generate_simulated_qe_data(self):
-        """Generate simulated QE data"""
-        sizes = {4: (1024, 1280), 3: (768, 960), 2: (512, 640)}
-        for factor in sizes:
-            h, w = sizes[factor]
-            # Generate base pattern with random noise
-            x = torch.linspace(0, 1, w)
-            y = torch.linspace(0, 1, h)
+        result['Img'] = Img
+        result['fileIndex'] = fileIndex
 
-            xx, yy = torch.meshgrid(x, y)
+    if index.size > 0:
+        pos = np.where((index[:, 1] == 0) & (index[:, 2] == 0))[0]
+        if len(pos) > 0:
+            pos_ref = pos[0]
+            dx_error = (index[:, 3] - index[pos_ref, 3]) - np.round(index[:, 3] - index[pos_ref, 3])
+            dy_error = (index[:, 4] - index[pos_ref, 4]) - np.round(index[:, 4] - index[pos_ref, 4])
+            index = np.hstack((index, dx_error[:, None], dy_error[:, None]))
+            result['index'] = index
 
-            if xx.shape[0] != h or xx.shape[1] != w:
-                xx = xx.T
-                yy = yy.T
-
-            base_pattern = 0.5 + 0.2 * torch.sin(xx * math.pi * 4) * torch.cos(yy * math.pi * 4)
-            noise = torch.randn(h, w) * 0.05
-            self.qe_brightness[factor] = base_pattern + noise
-            self.qe_contrast[factor] = 0.2 + 0.1 * torch.rand(h, w)
-
-    def get_qe_patch(self, factor, pos, size):
-        """Get QE data patch at specified position and size"""
-        if not self.loaded:
-            self.load_qe_data()
-
-        n, m = pos  # Original image position
-        patch_h, patch_w = size  # Patch size
-
-        # Calculate position in QE data
-        qe_h, qe_w = self.qe_brightness[factor].shape
-        start_y = min(max(0, (n - 1) * factor), qe_h - patch_h)
-        start_x = min(max(0, (m - 1) * factor), qe_w - patch_w)
-
-        # Extract brightness and contrast components
-        bright_patch = self.qe_brightness[factor][start_y:start_y + patch_h, start_x:start_x + patch_w]
-        contrast_patch = self.qe_contrast[factor][start_y:start_y + patch_h, start_x:start_x + patch_w]
-
-        return bright_patch, contrast_patch
+    return result
 
 
-# -------------------------- Evolutionary Algorithm Implementation --------------------------
-class EvolutionaryAlgorithm:
-    def __init__(self, obj_func, x_min, x_max):
-        self.obj_func = obj_func
-        self.x_min = x_min
-        self.x_max = x_max
-        self.dim = len(x_min)
-
-        # Population and fitness
-        self.population = None
-        self.fitness = None
-
-        # Best solution
-        self.best_solution = None
-        self.best_fitness = -float('inf')
-
-    def initialize_population(self):
-        """Step1: Population initialization"""
-        self.population = torch.zeros((config.pop_size, self.dim))
-        for i in range(config.pop_size):
-            for j in range(self.dim):
-                self.population[i, j] = self.x_min[j] + torch.rand(1).item() * (self.x_max[j] - self.x_min[j])
-        self.evaluate_population()
-        self.update_best_solution()
-
-    def evaluate_population(self):
-        """Step2: Individual evaluation"""
-        self.fitness = torch.zeros(config.pop_size)
-        for i in range(config.pop_size):
-            self.fitness[i] = self.obj_func(self.population[i])
-
-    def update_best_solution(self):
-        """Update best solution"""
-        current_best_idx = torch.argmax(self.fitness)
-        current_best_fitness = self.fitness[current_best_idx]
-        if current_best_fitness > self.best_fitness:
-            self.best_fitness = current_best_fitness
-            self.best_solution = self.population[current_best_idx].clone()
-
-    def neighborhood_search(self, individual):
-        """Step4: Neighborhood search (Basin Hopping)"""
-        neighbor = individual + config.stride * torch.randn_like(individual)
-        for j in range(self.dim):
-            neighbor[j] = torch.clamp(neighbor[j], self.x_min[j], self.x_max[j])
-        return neighbor
-
-    def crossover(self, individual):
-        """Step5: Crossover operation"""
-        # Select two high-fitness parents
-        sorted_indices = torch.argsort(self.fitness, descending=True)
-
-        p1_idx = sorted_indices[torch.randint(0, min(5, config.pop_size), (1,)).item()]
-        p2_idx = sorted_indices[torch.randint(0, min(5, config.pop_size), (1,)).item()]
-
-        while p1_idx == p2_idx:
-            p2_idx = sorted_indices[torch.randint(0, min(5, config.pop_size), (1,)).item()]
-
-        parent1 = self.population[p1_idx]
-        parent2 = self.population[p2_idx]
-
-        # Perform crossover
-        child = individual.clone()
-        for j in range(self.dim):
-            if torch.rand(1).item() < config.CR:
-                child[j] = parent1[j] + torch.rand(1).item() * (parent2[j] - parent1[j])
-
-        for j in range(self.dim):
-            child[j] = torch.clamp(child[j], self.x_min[j], self.x_max[j])
-        return child
-
-    def mutate(self, individual):
-        """Step6: Mutation operation"""
-        k = torch.randint(0, config.pop_size, (1,)).item()
-        l = torch.randint(0, config.pop_size, (1,)).item()
-
-        while k == l:
-            l = torch.randint(0, config.pop_size, (1,)).item()
-
-        return individual + config.F * (self.population[k] - self.population[l])
-
-    def optimize(self, progress_callback=None):
-        """Main optimization process"""
-        self.initialize_population()
-
-        for gen in range(config.max_iter):
-            # Step3: Termination condition check
-            if self.best_fitness > 0.99:
-                break
-
-            new_population = self.population.clone()
-            new_fitness = self.fitness.clone()
-
-            for i in range(config.pop_size):
-                # Current individual
-                current_ind = self.population[i].clone()
-                current_fit = self.fitness[i]
-
-                # Neighborhood search
-                neighbor = self.neighborhood_search(current_ind)
-                neighbor_fit = self.obj_func(neighbor)
-                if neighbor_fit > current_fit:
-                    current_ind, current_fit = neighbor, neighbor_fit
-
-                # Crossover operation
-                child = self.crossover(current_ind)
-                child_fit = self.obj_func(child)
-                if child_fit > current_fit:
-                    current_ind, current_fit = child, child_fit
-
-                # Mutation operation
-                mutant = self.mutate(current_ind)
-                mutant_fit = self.obj_func(mutant)
-                if mutant_fit > current_fit:
-                    current_ind, current_fit = mutant, mutant_fit
-
-                # Step7: Selection operation
-                new_population[i] = current_ind
-                new_fitness[i] = current_fit
-
-            # Update population
-            self.population = new_population
-            self.fitness = new_fitness
-            self.update_best_solution()
-
-            # Progress callback
-            if progress_callback and (gen + 1) % 10 == 0:
-                progress = (gen + 1) / config.max_iter * 100
-                progress_callback(progress)
-
-        return self.best_solution, self.best_fitness
+def objective_function(R, xl4b, I):
+    residuals = np.dot(xl4b, R) - I
+    return np.sum(residuals ** 2)
 
 
-# -------------------------- Displacement Calculation Class --------------------------
-class DisplacementCalculator:
-    def __init__(self):
-        self.displacements = None  # Store frame displacements [dx, dy]
-        self.ccr_values = None  # Store cross-correlation coefficients
+def evolutionary_algorithm_solve_bh4(xl4b, I, qs1, N_pop, N_gen, F, CR, bh_niter, bh_temp, D=16):
+    def obj_wrapper(R):
+        return objective_function(R, xl4b, I)
 
-    def calculate_ccr(self, img1, img2):
-        """Calculate Cross-Correlation Coefficient (CCR)"""
-        img1_norm = (img1 - img1.mean()) / (img1.std() + 1e-8)
-        img2_norm = (img2 - img2.mean()) / (img2.std() + 1e-8)
-        return torch.mean(img1_norm * img2_norm)
+    R_min = np.zeros(D)
+    R_max = np.clip(qs1 * 1.5, a_min=1.0, a_max=None)
+    bounds = list(zip(R_min, R_max))
 
-    def find_best_match(self, ref_img, target_img, search_window=10):
-        """Find best matching position within search window"""
-        h, w = ref_img.shape
-        max_ccr = -float('inf')
-        best_dx, best_dy = 0, 0
+    minimizer_kwargs = {"method": "L-BFGS-B", "bounds": bounds}
 
-        # Slide within search window
-        for dy in range(-search_window, search_window + 1):
-            for dx in range(-search_window, search_window + 1):
-                # Calculate shifted image
-                shifted = torch.roll(target_img, shifts=(dy, dx), dims=(0, 1))
-                # Calculate CCR for overlapping region
-                ccr = self.calculate_ccr(ref_img, shifted)
-                if ccr > max_ccr:
-                    max_ccr = ccr
-                    best_dx, best_dy = dx, dy
+    X_g = R_min + np.random.rand(N_pop, D) * (R_max - R_min)
+    if N_pop > 0:
+        X_g[0, :] = qs1
 
-        return best_dx, best_dy, max_ccr
+    fitness_g = np.array([obj_wrapper(X) for X in X_g])
 
-    def calculate_all_displacements(self, img_array, ref_idx=0):
-        """Calculate displacements of all frames relative to reference frame"""
-        num_frames, h, w = img_array.shape
-        self.displacements = torch.zeros(num_frames, 2)
-        self.ccr_values = torch.zeros(num_frames)
-        ref_img = img_array[ref_idx]
+    for g in range(N_gen):
+        X_g_next = np.copy(X_g)
+        fitness_g_next = np.copy(fitness_g)
 
-        for i in range(num_frames):
-            if i == ref_idx:
-                self.displacements[i] = torch.tensor([0.0, 0.0])
-                self.ccr_values[i] = 1.0
+        sorted_indices = np.argsort(fitness_g)
+        X_g = X_g[sorted_indices]
+        fitness_g = fitness_g[sorted_indices]
+
+        X_g_bh_enhanced = np.copy(X_g)
+        fitness_g_bh_enhanced = np.copy(fitness_g)
+
+        for i in range(N_pop):
+            Xi_g = X_g[i]
+
+            bh_result = basinhopping(
+                obj_wrapper,
+                Xi_g,
+                minimizer_kwargs=minimizer_kwargs,
+                bh_niter=10,
+                niter=bh_niter,
+                T=bh_temp,
+                disp=False
+            )
+
+            Ui_g_step4 = bh_result.x
+            fitness_u_step4 = bh_result.fun
+
+            if fitness_u_step4 < fitness_g[i]:
+                X_g_bh_enhanced[i] = Ui_g_step4
+                fitness_g_bh_enhanced[i] = fitness_u_step4
+
+        for i in range(N_pop):
+            Xi_g_current = X_g_bh_enhanced[i]
+            fitness_i_current = fitness_g_bh_enhanced[i]
+
+            idxs = [idx for idx in range(N_pop) if idx != i]
+
+            if len(idxs) < 2:
+                X_g_next[i] = Xi_g_current
+                fitness_g_next[i] = fitness_i_current
                 continue
 
-            dx, dy, ccr = self.find_best_match(ref_img, img_array[i])
-            self.displacements[i] = torch.tensor([dx, dy])
-            self.ccr_values[i] = ccr
-
-        return self.displacements
-
-
-# -------------------------- PSI Reconstruction Core Class --------------------------
-class PSIReconstructor:
-    def __init__(self):
-        # Data storage
-        self.img_files = []
-        self.img_array = None  # [N, H, W]
-        self.ref_img = None  # Reference image
-        self.index_array = None  # Displacement indices
-
-        # Processing tools
-        self.data_processor = DataProcessor()
-        self.qe_handler = QEDataHandler()
-        self.displacement_calc = DisplacementCalculator()
-
-        # Result storage
-        self.psi_result = None
-        self.init_guess = None  # Initial guess values
-
-    def load_image_sequence(self, folder_path):
-        """Load image sequence"""
-        config.img_folder = folder_path
-        # Get all image files
-        self.img_files = [
-            f for f in os.listdir(folder_path)
-            if f.lower().endswith(('.tif', '.tiff', '.png', '.jpg'))
-        ]
-        self.img_files = self.data_processor.natural_sort(self.img_files)
-
-        if not self.img_files:
-            raise ValueError("No image files found")
-
-        # Load image sequence
-        img_list = []
-        for f in self.img_files:
-            img_path = os.path.join(folder_path, f)
-            img = self.data_processor.load_image(img_path)
-            if img is not None:
-                img_list.append(img)
-
-        # Crop ROI
-        self.img_array = torch.stack(img_list, dim=0)
-        self.img_array = self.data_processor.crop_image(self.img_array, config.roi)
-        self.ref_img = self.img_array[config.ref_frame_idx].clone()
-
-        return self.img_array.shape[1], self.img_array.shape[2]  # H, W
-
-    def prepare_initial_guess(self, h, w):
-        """Prepare initial guess (multi-frame average)"""
-        factor = config.sr_factor
-        self.init_guess = torch.zeros(h * factor, w * factor)
-
-        # Average after upsampling each frame
-        for i in range(self.img_array.shape[0]):
-            upsampled = self.data_processor.resize_image(self.img_array[i], factor)
-            self.init_guess += upsampled
-
-        self.init_guess /= self.img_array.shape[0]
-
-        # Remove extreme value influence
-        max_val = torch.mean(self.init_guess) + 3 * torch.std(self.init_guess)
-        min_val = torch.mean(self.init_guess) - 3 * torch.std(self.init_guess)
-        self.init_guess = torch.clamp(self.init_guess, min_val, max_val)
-
-        return self.init_guess
-
-    def reconstruct_4x(self, h, w, progress_callback=None):
-        """4x PSI reconstruction"""
-        factor = 4
-        self.psi_result = torch.zeros(h * factor, w * factor)
-        total_patches = h * w
-        completed = 0
-
-        # Prepare initial guess
-        self.prepare_initial_guess(h, w)
-
-        # Process pixel by pixel
-        for n in range(1, h + 1):
-            for m in range(1, w + 1):
-                # 1. Extract multi-frame observations at current position
-                I = []
-                for num in range(config.start_num, config.end_num + 1):
-                    # Calculate observation value for current frame (original pixel value × factor²)
-                    frame_idx = num - 1  # Convert to 0-based index
-                    if frame_idx >= self.img_array.shape[0]:
-                        continue
-
-                    # Get displacement information
-                    dx, dy = self.index_array[frame_idx]
-                    # Calculate corresponding position
-                    pos_n = min(max(n + int(dy), 1), h)
-                    pos_m = min(max(m + int(dx), 1), w)
-                    # Extract observation value
-                    obs_value = self.img_array[frame_idx, pos_n - 1, pos_m - 1] * (factor ** 2)
-                    I.append(obs_value)
-                I = torch.tensor(I)
-
-                # 2. Extract QE data patch and build feature matrix xl4b
-                xl4b = []
-                for num in range(config.start_num, config.end_num + 1):
-                    frame_idx = num - 1
-                    if frame_idx >= self.img_array.shape[0]:
-                        continue
-
-                    # Get QE brightness and contrast components
-                    bright_patch, contrast_patch = self.qe_handler.get_qe_patch(
-                        factor, (n, m), (factor, factor)
-                    )
-
-                    # Extract features (corresponding to original MATLAB code structure)
-                    row1 = bright_patch[0, :]  # Row 4*n-3
-                    row2 = bright_patch[1, :]  # Row 4*n-2
-                    row3 = bright_patch[2, :]  # Row 4*n-1
-                    row4 = bright_patch[3, :]  # Row 4*n
-
-                    c_row1 = contrast_patch[0, :]  # Row 4*n-3
-                    c_row2 = contrast_patch[1, :]  # Row 4*n-2
-                    c_row3 = contrast_patch[2, :]  # Row 4*n-1
-                    c_row4 = contrast_patch[3, :]  # Row 4*n
-
-                    # Build feature vector (consistent with original xl4b structure)
-                    features = torch.cat([
-                        row1, row2, row3, row4,
-                        c_row1, c_row2, c_row3, c_row4
-                    ])
-                    xl4b.append(features)
-                xl4b = torch.stack(xl4b)
-
-                # 3. Define nonlinear model and fitness function
-                def model_func(x, s):
-                    # x: [16] parameters to optimize
-                    # s: [32] feature vector
-                    linear_term = (
-                            x[0] * s[:, 0] + x[1] * s[:, 1] + x[2] * s[:, 2] + x[3] * s[:, 3] +
-                            x[4] * s[:, 4] + x[5] * s[:, 5] + x[6] * s[:, 6] + x[7] * s[:, 7] +
-                            x[8] * s[:, 8] + x[9] * s[:, 9] + x[10] * s[:, 10] + x[11] * s[:, 11] +
-                            x[12] * s[:, 12] + x[13] * s[:, 13] + x[14] * s[:, 14] + x[15] * s[:, 15]
-                    )
-                    quadratic_term = (
-                            x[0] ** 2 * s[:, 16] + x[1] ** 2 * s[:, 17] + x[2] ** 2 * s[:, 18] + x[3] ** 2 * s[:, 19] +
-                            x[4] ** 2 * s[:, 20] + x[5] ** 2 * s[:, 21] + x[6] ** 2 * s[:, 22] + x[7] ** 2 * s[:, 23] +
-                            x[8] ** 2 * s[:, 24] + x[9] ** 2 * s[:, 25] + x[10] ** 2 * s[:, 26] + x[11] ** 2 * s[:,
-                                                                                                               27] +
-                            x[12] ** 2 * s[:, 28] + x[13] ** 2 * s[:, 29] + x[14] ** 2 * s[:, 30] + x[15] ** 2 * s[:,
-                                                                                                                 31]
-                    )
-                    return linear_term + quadratic_term
-
-                def obj_func(x):
-                    pred = model_func(x, xl4b)
-                    loss = torch.sum((pred - I) ** 2)
-                    return 1.0 / (1.0 + loss)  # Higher fitness for smaller error
-
-                # 4. Set initial point and parameter boundaries
-                start_row = (n - 1) * factor
-                start_col = (m - 1) * factor
-                start_point = self.init_guess[
-                              start_row:start_row + factor,
-                              start_col:start_col + factor
-                              ].flatten()
-
-                x_min = (start_point - 10).tolist()
-                x_max = (start_point + 10).tolist()
-
-                # 5. Evolutionary algorithm optimization
-                optimizer = EvolutionaryAlgorithm(obj_func, x_min, x_max)
-                best_params, _ = optimizer.optimize()
-
-                # 6. Update reconstruction result
-                self.psi_result[
-                start_row:start_row + factor,
-                start_col:start_col + factor
-                ] = best_params.reshape(factor, factor)
-
-                # Update progress
-                completed += 1
-                if progress_callback and completed % 10 == 0:
-                    progress = (completed / total_patches) * 100
-                    progress_callback(progress)
-
-        return self.psi_result
-
-    def reconstruct_3x(self, h, w, progress_callback=None):
-        """3x PSI reconstruction"""
-        factor = 3
-        self.psi_result = torch.zeros(h * factor, w * factor)
-        total_patches = h * w
-        completed = 0
-
-        # Prepare initial guess
-        self.prepare_initial_guess(h, w)
-
-        # Process pixel by pixel
-        for n in range(1, h + 1):
-            for m in range(1, w + 1):
-                # 1. Extract multi-frame observations at current position
-                I = []
-                for num in range(config.start_num, config.end_num + 1):
-                    frame_idx = num - 1
-                    if frame_idx >= self.img_array.shape[0]:
-                        continue
-
-                    dx, dy = self.index_array[frame_idx]
-                    pos_n = min(max(n + int(dy), 1), h)
-                    pos_m = min(max(m + int(dx), 1), w)
-                    obs_value = self.img_array[frame_idx, pos_n - 1, pos_m - 1] * (factor ** 2)
-                    I.append(obs_value)
-                I = torch.tensor(I)
-
-                # 2. Extract QE data patch and build feature matrix xl3b
-                xl3b = []
-                for num in range(config.start_num, config.end_num + 1):
-                    frame_idx = num - 1
-                    if frame_idx >= self.img_array.shape[0]:
-                        continue
-
-                    bright_patch, contrast_patch = self.qe_handler.get_qe_patch(
-                        factor, (n, m), (factor, factor)
-                    )
-
-                    # Extract features (corresponding to original MATLAB code structure)
-                    row1 = bright_patch[0, :]  # Row 3*n-2
-                    row2 = bright_patch[1, :]  # Row 3*n-1
-                    row3 = bright_patch[2, :]  # Row 3*n
-
-                    c_row1 = contrast_patch[0, :]  # Row 3*n-2
-                    c_row2 = contrast_patch[1, :]  # Row 3*n-1
-                    c_row3 = contrast_patch[2, :]  # Row 3*n
-
-                    # Build feature vector (consistent with original xl3b structure)
-                    features = torch.cat([
-                        row1, row2, row3,
-                        c_row1, c_row2, c_row3
-                    ])
-                    xl3b.append(features)
-                xl3b = torch.stack(xl3b)
-
-                # 3. Define nonlinear model and fitness function
-                def model_func(x, s):
-                    # x: [9] parameters to optimize
-                    linear_term = (
-                            x[0] * s[:, 0] + x[1] * s[:, 1] + x[2] * s[:, 2] +
-                            x[3] * s[:, 3] + x[4] * s[:, 4] + x[5] * s[:, 5] +
-                            x[6] * s[:, 6] + x[7] * s[:, 7] + x[8] * s[:, 8]
-                    )
-                    quadratic_term = (
-                            x[0] ** 2 * s[:, 9] + x[1] ** 2 * s[:, 10] + x[2] ** 2 * s[:, 11] +
-                            x[3] ** 2 * s[:, 12] + x[4] ** 2 * s[:, 13] + x[5] ** 2 * s[:, 14] +
-                            x[6] ** 2 * s[:, 15] + x[7] ** 2 * s[:, 16] + x[8] ** 2 * s[:, 17]
-                    )
-                    return linear_term + quadratic_term
-
-                def obj_func(x):
-                    pred = model_func(x, xl3b)
-                    loss = torch.sum((pred - I) ** 2)
-                    return 1.0 / (1.0 + loss)
-
-                # 4. Set initial point and parameter boundaries
-                start_row = (n - 1) * factor
-                start_col = (m - 1) * factor
-                start_point = self.init_guess[
-                              start_row:start_row + factor,
-                              start_col:start_col + factor
-                              ].flatten()
-
-                x_min = (start_point - 100).tolist()
-                x_max = (start_point + 100).tolist()
-
-                # 5. Evolutionary algorithm optimization
-                optimizer = EvolutionaryAlgorithm(obj_func, x_min, x_max)
-                best_params, _ = optimizer.optimize()
-
-                # 6. Update reconstruction result
-                self.psi_result[
-                start_row:start_row + factor,
-                start_col:start_col + factor
-                ] = best_params.reshape(factor, factor)
-
-                # Update progress
-                completed += 1
-                if progress_callback and completed % 10 == 0:
-                    progress = (completed / total_patches) * 100
-                    progress_callback(progress)
-
-        return self.psi_result
-
-    def reconstruct_2x(self, h, w, progress_callback=None):
-        """2x PSI reconstruction"""
-        factor = 2
-        self.psi_result = torch.zeros(h * factor, w * factor)
-        total_patches = h * w
-        completed = 0
-
-        # Prepare initial guess
-        self.prepare_initial_guess(h, w)
-
-        # Process pixel by pixel
-        for n in range(1, h + 1):
-            for m in range(1, w + 1):
-                # 1. Extract multi-frame observations at current position
-                I = []
-                for num in range(config.start_num, config.end_num + 1):
-                    frame_idx = num - 1
-                    if frame_idx >= self.img_array.shape[0]:
-                        continue
-
-                    dx, dy = self.index_array[frame_idx]
-                    pos_n = min(max(n + int(dy), 1), h)
-                    pos_m = min(max(m + int(dx), 1), w)
-                    obs_value = self.img_array[frame_idx, pos_n - 1, pos_m - 1] * (factor ** 2)
-                    I.append(obs_value)
-                I = torch.tensor(I)
-
-                # 2. Extract QE data patch and build feature matrix xl2b (corresponding to original MATLAB code)
-                xl2b = []
-                for num in range(config.start_num, config.end_num + 1):
-                    frame_idx = num - 1
-                    if frame_idx >= self.img_array.shape[0]:
-                        continue
-
-                    bright_patch, contrast_patch = self.qe_handler.get_qe_patch(
-                        factor, (n, m), (factor, factor)
-                    )
-
-                    # Extract features (strictly corresponding to original MATLAB code structure)
-                    row1 = bright_patch[0, :]  # Row 2*n-1
-                    row2 = bright_patch[1, :]  # Row 2*n
-
-                    c_row1 = contrast_patch[0, :]  # Row 2*n-1
-                    c_row2 = contrast_patch[1, :]  # Row 2*n
-
-                    # Build feature vector (consistent with original xl2b structure)
-                    features = torch.cat([
-                        row1,  # xl2b(num,1:2)
-                        row2,  # xl2b(num,3:4)
-                        c_row1,  # xl2b(num,5:6)
-                        c_row2  # xl2b(num,7:8)
-                    ])
-                    xl2b.append(features)
-                xl2b = torch.stack(xl2b)
-
-                # 3. Define nonlinear model and fitness function (strictly corresponding to original MATLAB code)
-                def model_func(x, s):
-                    # x: [4] parameters to optimize
-                    # Linear term: x(1)*s(:,1)+x(2)*s(:,2)+x(3)*s(:,3)+x(4)*s(:,4)
-                    linear_term = (
-                            x[0] * s[:, 0] + x[1] * s[:, 1] +
-                            x[2] * s[:, 2] + x[3] * s[:, 3]
-                    )
-                    # Quadratic term: x(1)^2*s(:,5)+x(2)^2*s(:,6)+x(3)^2*s(:,7)+x(4)^2*s(:,8)
-                    quadratic_term = (
-                            x[0] ** 2 * s[:, 4] + x[1] ** 2 * s[:, 5] +
-                            x[2] ** 2 * s[:, 6] + x[3] ** 2 * s[:, 7]
-                    )
-                    return linear_term + quadratic_term
-
-                # Fitness function: higher fitness for smaller error
-                def obj_func(x):
-                    pred = model_func(x, xl2b)
-                    loss = torch.sum((pred - I) ** 2)
-                    return 1.0 / (1.0 + loss)
-
-                # 4. Set initial point and parameter boundaries
-                start_row = (n - 1) * factor
-                start_col = (m - 1) * factor
-                start_point = self.init_guess[
-                              start_row:start_row + factor,
-                              start_col:start_col + factor
-                              ].flatten()
-
-                x_min = (start_point - 100).tolist()
-                x_max = (start_point + 100).tolist()
-
-                # 5. Evolutionary algorithm optimization
-                optimizer = EvolutionaryAlgorithm(obj_func, x_min, x_max)
-                best_params, _ = optimizer.optimize()
-
-                # 6. Update reconstruction result
-                self.psi_result[
-                start_row:start_row + factor,
-                start_col:start_col + factor
-                ] = best_params.reshape(factor, factor)
-
-                # Update progress
-                completed += 1
-                if progress_callback and completed % 10 == 0:
-                    progress = (completed / total_patches) * 100
-                    progress_callback(progress)
-
-        return self.psi_result
-
-    def post_processing(self):
-        """Post-processing: border clipping and filtering"""
-        if self.psi_result is None:
-            return
-
-        # Border clipping
-        if config.border_threshold:
-            max_val = self.psi_result.max()
-            min_val = self.psi_result.min()
-
-            if config.sr_factor == 4:
-                self.psi_result = torch.clamp(self.psi_result, min_val - 300, max_val + 600)
-            elif config.sr_factor == 3:
-                self.psi_result = torch.clamp(self.psi_result, min_val - 500, max_val + 600)
-            else:  # 2x
-                self.psi_result = torch.clamp(self.psi_result, min_val - 500, max_val + 2000)
-
-    def run_reconstruction(self, progress_callback=None):
-        """Execute complete reconstruction process"""
-        start_time = time.time()
-
-        try:
-            # 1. Load data
-            if not config.img_folder:
-                raise ValueError("Please select image folder first")
-
-            h, w = self.load_image_sequence(config.img_folder)
-
-            # 2. Calculate displacements
-            self.index_array = self.displacement_calc.calculate_all_displacements(
-                self.img_array, config.ref_frame_idx
+            parent_indices = np.random.choice(idxs, 3, replace=False)
+            Xn_g = X_g_bh_enhanced[parent_indices[0]]
+            Xo_g = X_g_bh_enhanced[parent_indices[1]]
+            Xk_g = X_g_bh_enhanced[parent_indices[2]]
+
+            Ci_g = np.copy(Xi_g_current)
+            r = np.random.rand(D)
+            crossover_mask = r < CR
+
+            Ci_g[crossover_mask] = r[crossover_mask] * Xi_g_current[crossover_mask] + (1 - r[crossover_mask]) * Xn_g[
+                crossover_mask]
+
+            Ci_g = np.clip(Ci_g, R_min, R_max)
+            fitness_c = obj_wrapper(Ci_g)
+
+            candidates = [Xi_g_current, Xn_g, Ci_g]
+            candidates_fitness = [fitness_i_current, obj_wrapper(Xn_g), fitness_c]
+
+            best_idx = np.argmin(candidates_fitness)
+            Ui_g_step5 = candidates[best_idx]
+            fitness_u_step5 = candidates_fitness[best_idx]
+
+            Mi_g = Ui_g_step5 + F * (Xo_g - Xk_g)
+            Mi_g = np.clip(Mi_g, R_min, R_max)
+            fitness_m = obj_wrapper(Mi_g)
+
+            if fitness_m < fitness_u_step5:
+                Ui_g_step6 = Mi_g
+                fitness_u_step6 = fitness_m
+            else:
+                Ui_g_step6 = Ui_g_step5
+                fitness_u_step6 = fitness_u_step5
+
+            if fitness_u_step6 < fitness_i_current:
+                X_g_next[i] = Ui_g_step6
+                fitness_g_next[i] = fitness_u_step6
+            else:
+                X_g_next[i] = Xi_g_current
+                fitness_g_next[i] = fitness_i_current
+
+        X_g = X_g_next
+        fitness_g = fitness_g_next
+
+    best_idx = np.argmin(fitness_g)
+    R_best = X_g[best_idx]
+    best_fitness = fitness_g[best_idx]
+
+    return R_best, 0, best_fitness
+
+
+def evolutionary_algorithm_solve_bh3(xl4b, I, qs1, N_pop, N_gen, F, CR, bh_niter, bh_temp, D=9):
+    def obj_wrapper(R):
+        return objective_function(R, xl4b, I)
+
+    R_min = np.zeros(D)
+    R_max = np.clip(qs1 * 1.5, a_min=1.0, a_max=None)
+    bounds = list(zip(R_min, R_max))
+
+    minimizer_kwargs = {"method": "L-BFGS-B", "bounds": bounds}
+
+    X_g = R_min + np.random.rand(N_pop, D) * (R_max - R_min)
+    if N_pop > 0:
+        X_g[0, :] = qs1
+
+    fitness_g = np.array([obj_wrapper(X) for X in X_g])
+
+    for g in range(N_gen):
+        X_g_next = np.copy(X_g)
+        fitness_g_next = np.copy(fitness_g)
+
+        sorted_indices = np.argsort(fitness_g)
+        X_g = X_g[sorted_indices]
+        fitness_g = fitness_g[sorted_indices]
+
+        X_g_bh_enhanced = np.copy(X_g)
+        fitness_g_bh_enhanced = np.copy(fitness_g)
+
+        for i in range(N_pop):
+            Xi_g = X_g[i]
+
+            bh_result = basinhopping(
+                obj_wrapper,
+                Xi_g,
+                minimizer_kwargs=minimizer_kwargs,
+                bh_niter=10,
+                niter=bh_niter,
+                T=bh_temp,
+                disp=False
             )
 
-            # 3. Load QE data
-            self.qe_handler.load_qe_data()
+            Ui_g_step4 = bh_result.x
+            fitness_u_step4 = bh_result.fun
 
-            # 4. Select corresponding reconstruction function based on scaling factor
-            if config.sr_factor == 4:
-                self.reconstruct_4x(h, w, progress_callback)
-            elif config.sr_factor == 3:
-                self.reconstruct_3x(h, w, progress_callback)
+            if fitness_u_step4 < fitness_g[i]:
+                X_g_bh_enhanced[i] = Ui_g_step4
+                fitness_g_bh_enhanced[i] = fitness_u_step4
+
+        for i in range(N_pop):
+            Xi_g_current = X_g_bh_enhanced[i]
+            fitness_i_current = fitness_g_bh_enhanced[i]
+
+            idxs = [idx for idx in range(N_pop) if idx != i]
+
+            if len(idxs) < 2:
+                X_g_next[i] = Xi_g_current
+                fitness_g_next[i] = fitness_i_current
+                continue
+
+            parent_indices = np.random.choice(idxs, 3, replace=False)
+            Xn_g = X_g_bh_enhanced[parent_indices[0]]
+            Xo_g = X_g_bh_enhanced[parent_indices[1]]
+            Xk_g = X_g_bh_enhanced[parent_indices[2]]
+
+            Ci_g = np.copy(Xi_g_current)
+            r = np.random.rand(D)
+            crossover_mask = r < CR
+
+            Ci_g[crossover_mask] = r[crossover_mask] * Xi_g_current[crossover_mask] + (1 - r[crossover_mask]) * Xn_g[
+                crossover_mask]
+
+            Ci_g = np.clip(Ci_g, R_min, R_max)
+            fitness_c = obj_wrapper(Ci_g)
+
+            candidates = [Xi_g_current, Xn_g, Ci_g]
+            candidates_fitness = [fitness_i_current, obj_wrapper(Xn_g), fitness_c]
+
+            best_idx = np.argmin(candidates_fitness)
+            Ui_g_step5 = candidates[best_idx]
+            fitness_u_step5 = candidates_fitness[best_idx]
+
+            Mi_g = Ui_g_step5 + F * (Xo_g - Xk_g)
+            Mi_g = np.clip(Mi_g, R_min, R_max)
+            fitness_m = obj_wrapper(Mi_g)
+
+            if fitness_m < fitness_u_step5:
+                Ui_g_step6 = Mi_g
+                fitness_u_step6 = fitness_m
             else:
-                self.reconstruct_2x(h, w, progress_callback)
+                Ui_g_step6 = Ui_g_step5
+                fitness_u_step6 = fitness_u_step5
 
-            # 5. Post-processing
-            self.post_processing()
+            if fitness_u_step6 < fitness_i_current:
+                X_g_next[i] = Ui_g_step6
+                fitness_g_next[i] = fitness_u_step6
+            else:
+                X_g_next[i] = Xi_g_current
+                fitness_g_next[i] = fitness_i_current
 
-            # 6. Calculate processing time
-            config.processing_time = time.time() - start_time
-            return self.psi_result
+        X_g = X_g_next
+        fitness_g = fitness_g_next
+
+    best_idx = np.argmin(fitness_g)
+    R_best = X_g[best_idx]
+    best_fitness = fitness_g[best_idx]
+
+    return R_best, 0, best_fitness
+
+
+def evolutionary_algorithm_solve_bh2(xl4b, I, qs1, N_pop, N_gen, F, CR, bh_niter, bh_temp, D=4):
+    def obj_wrapper(R):
+        return objective_function(R, xl4b, I)
+
+    R_min = np.zeros(D)
+    R_max = np.clip(qs1 * 1.5, a_min=1.0, a_max=None)
+    bounds = list(zip(R_min, R_max))
+
+    minimizer_kwargs = {"method": "L-BFGS-B", "bounds": bounds}
+
+    X_g = R_min + np.random.rand(N_pop, D) * (R_max - R_min)
+    if N_pop > 0:
+        X_g[0, :] = qs1
+
+    fitness_g = np.array([obj_wrapper(X) for X in X_g])
+
+    for g in range(N_gen):
+        X_g_next = np.copy(X_g)
+        fitness_g_next = np.copy(fitness_g)
+
+        sorted_indices = np.argsort(fitness_g)
+        X_g = X_g[sorted_indices]
+        fitness_g = fitness_g[sorted_indices]
+
+        X_g_bh_enhanced = np.copy(X_g)
+        fitness_g_bh_enhanced = np.copy(fitness_g)
+
+        for i in range(N_pop):
+            Xi_g = X_g[i]
+
+            bh_result = basinhopping(
+                obj_wrapper,
+                Xi_g,
+                minimizer_kwargs=minimizer_kwargs,
+                bh_niter=10,
+                niter=bh_niter,
+                T=bh_temp,
+                disp=False
+            )
+
+            Ui_g_step4 = bh_result.x
+            fitness_u_step4 = bh_result.fun
+
+            if fitness_u_step4 < fitness_g[i]:
+                X_g_bh_enhanced[i] = Ui_g_step4
+                fitness_g_bh_enhanced[i] = fitness_u_step4
+
+        for i in range(N_pop):
+            Xi_g_current = X_g_bh_enhanced[i]
+            fitness_i_current = fitness_g_bh_enhanced[i]
+
+            idxs = [idx for idx in range(N_pop) if idx != i]
+
+            if len(idxs) < 2:
+                X_g_next[i] = Xi_g_current
+                fitness_g_next[i] = fitness_i_current
+                continue
+
+            parent_indices = np.random.choice(idxs, 3, replace=False)
+            Xn_g = X_g_bh_enhanced[parent_indices[0]]
+            Xo_g = X_g_bh_enhanced[parent_indices[1]]
+            Xk_g = X_g_bh_enhanced[parent_indices[2]]
+
+            Ci_g = np.copy(Xi_g_current)
+            r = np.random.rand(D)
+            crossover_mask = r < CR
+
+            Ci_g[crossover_mask] = r[crossover_mask] * Xi_g_current[crossover_mask] + (1 - r[crossover_mask]) * Xn_g[
+                crossover_mask]
+
+            Ci_g = np.clip(Ci_g, R_min, R_max)
+            fitness_c = obj_wrapper(Ci_g)
+
+            candidates = [Xi_g_current, Xn_g, Ci_g]
+            candidates_fitness = [fitness_i_current, obj_wrapper(Xn_g), fitness_c]
+
+            best_idx = np.argmin(candidates_fitness)
+            Ui_g_step5 = candidates[best_idx]
+            fitness_u_step5 = candidates_fitness[best_idx]
+
+            Mi_g = Ui_g_step5 + F * (Xo_g - Xk_g)
+            Mi_g = np.clip(Mi_g, R_min, R_max)
+            fitness_m = obj_wrapper(Mi_g)
+
+            if fitness_m < fitness_u_step5:
+                Ui_g_step6 = Mi_g
+                fitness_u_step6 = fitness_m
+            else:
+                Ui_g_step6 = Ui_g_step5
+                fitness_u_step6 = fitness_u_step5
+
+            if fitness_u_step6 < fitness_i_current:
+                X_g_next[i] = Ui_g_step6
+                fitness_g_next[i] = fitness_u_step6
+            else:
+                X_g_next[i] = Xi_g_current
+                fitness_g_next[i] = fitness_i_current
+
+        X_g = X_g_next
+        fitness_g = fitness_g_next
+
+    best_idx = np.argmin(fitness_g)
+    R_best = X_g[best_idx]
+    best_fitness = fitness_g[best_idx]
+
+    return R_best, 0, best_fitness
+
+
+class JCAPP1_Python(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("像素分割重构APP")
+        self.geometry("800x600")
+
+        self.imgfolder = None
+        self.imgfile_paths = []
+        self.imgfile_names = []
+        self.targetRegion = {
+            'srFactor': 4,
+            'frameIndex': 1,
+            'cropEnable': 1,
+            'imgCrop': None,
+            'lrImg': None
+        }
+        self.imgArray = None
+        self.indexArray = None
+        self.LR = None
+        self.HR4 = None
+        self.HR3 = None
+        self.HR2 = None
+        self.QE = None
+
+        self.create_widgets()
+
+        self.load_qe_data()
+
+    def load_qe_data(self):
+        global QE_DATA
+        try:
+            with np.load(QE_FILE_PATH, allow_pickle=True) as data:
+                QE_DATA = {k: v for k, v in data.items()}
+                print(f"Loaded QE data from {QE_FILE_PATH}")
+                self.QE = QE_DATA.get('lzxl4b')
+                if self.QE is None:
+                    first_key = next(iter(QE_DATA), None)
+                    if first_key:
+                        self.QE = QE_DATA[first_key]
+                        self.log_info(f"警告：未找到 'lzxl4b'，默认使用第一个键 '{first_key}'。")
+                    else:
+                        self.log_info("警告：QE数据文件为空。")
+        except FileNotFoundError:
+            messagebox.showerror("错误", f"未找到QE文件：{QE_FILE_PATH}")
+        except Exception as e:
+            messagebox.showerror("错误", f"加载QE文件失败：{e}")
+
+    def create_widgets(self):
+        control_frame = ttk.Frame(self)
+        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+
+        info_frame = ttk.Frame(self)
+        info_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        ttk.Button(control_frame, text="1. 选取图像序列文件夹", command=self.read_pictures_callback).pack(fill=tk.X, pady=5)
+        ttk.Label(control_frame, text="参考帧 (1-based):").pack(pady=2)
+        self.referframe_entry = ttk.Entry(control_frame)
+        self.referframe_entry.insert(0, "1")
+        self.referframe_entry.pack(fill=tk.X, pady=2)
+        ttk.Button(control_frame, text="2. 选择区域", command=self.select_region_callback).pack(fill=tk.X, pady=5)
+        ttk.Button(control_frame, text="3. 计算位移并筛选帧", command=self.ccldisplacement_callback).pack(fill=tk.X, pady=5)
+        ttk.Button(control_frame, text="4. PSI 像素分割成像重构", command=self.psi_callback).pack(fill=tk.X, pady=5)
+        ttk.Button(control_frame, text="5. 保存结果", command=self.save_pictures_callback).pack(fill=tk.X, pady=5)
+        # ttk.Button(control_frame, text="6. 绘制对比度", command=self.draw_contrast_callback).pack(fill=tk.X, pady=5)
+
+        params_frame = ttk.LabelFrame(control_frame, text="PSI参数")
+        params_frame.pack(fill=tk.X, pady=10)
+
+        ttk.Label(params_frame, text="QE 版本 (lzxl4b, ...):").pack(pady=2)
+        self.qe_number = ttk.Combobox(params_frame, values=["lzxl4b", "lzxl4b2", "lzxl4b3", "lzxl4b4",
+                                                            "lzxl4b1", "lzxl1b1", "lzxl1b2", "lzxl1b3",
+                                                            "lzxl1bc", "lzxl2b", "lzxl4b6"], state="readonly")
+        self.qe_number.current(0)
+        self.qe_number.pack(fill=tk.X, pady=2)
+        ttk.Label(params_frame, text="使用起始帧:").pack(pady=2)
+        self.usestart_entry = ttk.Entry(params_frame)
+        self.usestart_entry.insert(0, "1")
+        self.usestart_entry.pack(fill=tk.X, pady=2)
+        ttk.Label(params_frame, text="使用结束帧:").pack(pady=2)
+        self.useend_entry = ttk.Entry(params_frame)
+        self.useend_entry.insert(0, "16")
+        self.useend_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(params_frame, text="EA 代数 (N_gen):").pack(pady=2)
+        self.ea_gen_entry = ttk.Entry(params_frame)
+        self.ea_gen_entry.insert(0, "6")
+        self.ea_gen_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(params_frame, text="EA 种群大小 (N_pop):").pack(pady=2)
+        self.ea_pop_entry = ttk.Entry(params_frame)
+        self.ea_pop_entry.insert(0, "100")
+        self.ea_pop_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(params_frame, text="EA F (变异因子):").pack(pady=2)
+        self.ea_F_entry = ttk.Entry(params_frame)
+        self.ea_F_entry.insert(0, "0.5")
+        self.ea_F_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(params_frame, text="EA CR (交叉率):").pack(pady=2)
+        self.ea_CR_entry = ttk.Entry(params_frame)
+        self.ea_CR_entry.insert(0, "0.9")
+        self.ea_CR_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(params_frame, text="BH 迭代次数 (niter):").pack(pady=2)
+        self.bh_niter_entry = ttk.Entry(params_frame)
+        self.bh_niter_entry.insert(0, "5")
+        self.bh_niter_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(params_frame, text="BH 温度 (T):").pack(pady=2)
+        self.bh_temp_entry = ttk.Entry(params_frame)
+        self.bh_temp_entry.insert(0, "10.0")
+        self.bh_temp_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(info_frame, text="信息和状态：").pack(anchor=tk.W)
+        self.information_text = tk.Text(info_frame, height=5)
+        self.information_text.pack(fill=tk.X, pady=5)
+        self.fig, self.axes = plt.subplots(1, 2, figsize=(8, 4))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=info_frame)
+        self.canvas_widget = self.canvas.get_tk_widget()
+        self.canvas.mpl_connect('button_press_event', self.on_mpl_click)
+        self.canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+    def log_info(self, message):
+        self.information_text.insert(tk.END, message + "\n")
+        self.information_text.see(tk.END)
+
+    def on_mpl_click(self, event):
+        pass
+
+    def update_image_display(self, lr_img=None, hr_img=None, title1="LR 图像", title2="HR 图像"):
+        self.axes[0].cla()
+        self.axes[1].cla()
+
+        if lr_img is not None:
+            self.axes[0].imshow(lr_img, cmap='gray')
+            self.axes[0].set_title(title1)
+
+        if hr_img is not None:
+            self.axes[1].imshow(hr_img, cmap='gray')
+            self.axes[1].set_title(title2)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def read_pictures_callback(self):
+        folder_path = filedialog.askdirectory(title="选取拍摄图序文件夹")
+        if folder_path:
+            self.imgfolder = folder_path
+            self.log_info(f"读取的文件路径：{self.imgfolder}")
+
+            all_files = glob.glob(os.path.join(self.imgfolder, '*.tif'))
+            self.imgfile_paths = sort_nat(all_files)
+            self.imgfile_names = [os.path.basename(p) for p in self.imgfile_paths]
+            self.log_info(f"找到 {len(self.imgfile_paths)} 个 .tif 文件")
+
+            try:
+                rff = int(self.referframe_entry.get())
+                if rff > 0 and rff <= len(self.imgfile_paths):
+                    ref_img = imread_tif(self.imgfile_paths[rff - 1])
+                    self.update_image_display(ref_img, title1=f"参考帧 {rff}", title2="HR 结果")
+                else:
+                    self.log_info(f"错误：参考帧 {rff} 索引超出文件范围。")
+            except Exception as e:
+                self.log_info(f"错误：无法显示参考帧。{e}")
+
+    def select_region_callback(self):
+        if not self.imgfile_paths:
+            self.log_info("请先选取文件夹。")
+            return
+
+        try:
+            rff = int(self.referframe_entry.get())
+            if rff <= 0 or rff > len(self.imgfile_paths):
+                self.log_info("参考帧输入无效或超出文件范围。")
+                return
+        except ValueError:
+            self.log_info("参考帧输入无效。")
+            return
+
+        self.targetRegion['frameIndex'] = rff
+        self.log_info(f"参考帧为 {rff}")
+
+        try:
+            LRALL = imread_tif(self.imgfile_paths[rff - 1])
+            if LRALL is None:
+                self.log_info("无法读取参考帧图像。")
+                return
+
+            self.log_info("请在新弹出的图窗上画框选择区域，双击确认。")
+
+            plt.ion()
+            fig, ax = plt.subplots()
+            ax.imshow(LRALL, cmap='gray')
+            ax.set_title("请选择ROI (双击确认)")
+
+            self.roi_rect = None
+
+            def on_select(eclick, erelease):
+                x1, y1 = eclick.xdata, eclick.ydata
+                x2, y2 = erelease.xdata, erelease.ydata
+                self.roi_rect = [min(x1, x2), min(y1, y2), abs(x1 - x2), abs(y1 - y2)]
+
+            def on_double_click(event):
+                if self.roi_rect and event.inaxes:
+                    xmin = np.round(self.roi_rect[0]) + 1
+                    ymin = np.round(self.roi_rect[1]) + 1
+                    width = np.round(self.roi_rect[2])
+                    height = np.round(self.roi_rect[3])
+                    width = max(1, width)
+                    height = max(1, height)
+                    self.targetRegion['imgCrop'] = np.array([xmin, ymin, width, height], dtype=np.int32)
+                    self.log_info(f"选定的区域 (1-based, [x, y, w, h]): {self.targetRegion['imgCrop']}")
+                    self.update_image_display(LRALL, title1=f"已选ROI参考帧 {rff}", title2="HR 结果")
+                    plt.close(fig)
+                    plt.ioff()
+                elif event.inaxes:
+                    self.log_info("未选择区域或选择无效。")
+
+            rs = RectangleSelector(ax, on_select,
+                                   drawtype='box', useblit=True,
+                                   button=[1],
+                                   minspanx=5, minspany=5,
+                                   spancoords='pixels', interactive=True)
+
+            fig.canvas.mpl_connect('button_press_event',
+                                   lambda event: on_double_click(event) if event.dblclick else None)
+
+            plt.show(block=True)
 
         except Exception as e:
-            print(f"Reconstruction failed: {e}")
-            import traceback
-            traceback.print_exc()
+            self.log_info(f"错误：选择区域失败。{e}")
+            plt.ioff()
+
+    def getTargetArray(self, ccrResult, frameIndex):
+
+        targetRegion = self.targetRegion
+        imgCrop = targetRegion['imgCrop']
+        srFactor = targetRegion['srFactor']
+        range_val = 0.004
+        frame = srFactor ** 2
+
+        result_find = imgMovementFind(ccrResult, self.imgfile_paths, frameIndex, range_val, imgCrop, 1)
+        index = result_find['index']
+        Img = result_find['Img']
+
+        state = 1
+        max_iter = 50
+        count = 0
+
+        while (index.shape[0] < frame or (state and index.shape[0] > frame * 1.5)) and count < max_iter:
+            if index.shape[0] < frame:
+                range_val += 0.0005
+                state = 0
+            else:
+                range_val -= 0.0005
+                state = 1
+
+            result_find = imgMovementFind(ccrResult, self.imgfile_paths, frameIndex, range_val, imgCrop, 1)
+            index = result_find['index']
+            Img = result_find['Img']
+            count += 1
+
+        if index.shape[0] == 0:
+            self.log_info("错误：未找到满足条件的图像帧。请检查参数或ROI。")
             return None
 
+        self.log_info(f"位移查找完成，找到 {index.shape[0]} 帧。最终容差范围: {range_val:.4f}")
 
-# -------------------------- GUI Interface Class --------------------------
-class PSIGUI:
-    def __init__(self):
-        self.reconstructor = PSIReconstructor()
-        self.roi_selector = None
+        imgCrop_base = imgCrop.copy()
+        indexArray = np.tile(imgCrop_base, (index.shape[0], 1)).astype(np.int32)
+        indexArray[:, 0] += index[:, 1].astype(np.int32)
+        indexArray[:, 1] += index[:, 2].astype(np.int32)
 
-        warnings.filterwarnings('ignore', category=UserWarning)
-        warnings.filterwarnings('ignore', category=FutureWarning)
+        result = {}
+        result['indexArray'] = indexArray
+        result['imgArray'] = Img['img']
+        result['lrImg'] = Img['imgRef']
 
-        self.init_ui()
+        return result
 
-    def init_ui(self):
-        """Initialize GUI interface"""
-        plt.rcParams["font.family"] = ["Arial", "Helvetica", "sans-serif"]
-        plt.rcParams["axes.unicode_minus"] = False
-
-        # Create main window
-        self.fig = plt.figure(figsize=(16, 12))
-        self.fig.canvas.manager.set_window_title("Pixel-segmenting Imaging (PSI) System")
-
-        # Create subplots with proper spacing using gridspec
-        gs = self.fig.add_gridspec(10, 8, hspace=0.3, wspace=0.3)
-
-        # Main image display areas
-        self.ax_original = self.fig.add_subplot(gs[0:4, 0:3])
-        self.ax_roi = self.fig.add_subplot(gs[0:4, 4:7])
-        self.ax_displacement = self.fig.add_subplot(gs[5:9, 0:3])
-        self.ax_result = self.fig.add_subplot(gs[5:9, 4:7])
-
-        # Set subplot titles
-        self.ax_original.set_title("Original Reference Image")
-        self.ax_roi.set_title("ROI Region")
-        self.ax_displacement.set_title("Inter-frame Displacement")
-        self.ax_result.set_title("PSI Reconstruction Result")
-
-        # Status display area
-        self.ax_status = self.fig.add_axes([0.1, 0.02, 0.8, 0.03])
-        self.ax_status.axis('off')
-        self.status_text = self.ax_status.text(0, 0.5, config.status,
-                                               verticalalignment='center', fontsize=10)
-
-        # Progress bar
-        self.ax_progress = self.fig.add_axes([0.1, 0.06, 0.8, 0.02])
-        self.ax_progress.axis('off')
-        self.progress_bar = plt.Rectangle((0, 0), 0, 1, fc='green')
-        self.ax_progress.add_patch(self.progress_bar)
-
-        # Button area
-        btn_width = 0.15
-        btn_height = 0.04
-
-        # Load images button
-        self.ax_btn_load = self.fig.add_axes([0.05, 0.10, btn_width, btn_height])
-        self.btn_load = Button(self.ax_btn_load, 'Load Image Sequence')
-        self.btn_load.on_clicked(self.on_load_images)
-
-        # Select ROI button
-        self.ax_btn_roi = self.fig.add_axes([0.22, 0.10, btn_width, btn_height])
-        self.btn_roi = Button(self.ax_btn_roi, 'Select ROI Region')
-        self.btn_roi.on_clicked(self.on_select_roi)
-
-        # Calculate displacement button
-        self.ax_btn_disp = self.fig.add_axes([0.39, 0.10, btn_width, btn_height])
-        self.btn_disp = Button(self.ax_btn_disp, 'Calculate Displacements')
-        self.btn_disp.on_clicked(self.on_calc_displacement)
-
-        # Start reconstruction button
-        self.ax_btn_recon = self.fig.add_axes([0.56, 0.10, btn_width, btn_height])
-        self.btn_recon = Button(self.ax_btn_recon, 'Start PSI Reconstruction')
-        self.btn_recon.on_clicked(self.on_start_reconstruction)
-
-        # Save result button
-        self.ax_btn_save = self.fig.add_axes([0.73, 0.10, btn_width, btn_height])
-        self.btn_save = Button(self.ax_btn_save, 'Save Result')
-        self.btn_save.on_clicked(self.on_save_result)
-
-        self.fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.12, hspace=0.3, wspace=0.3)
-
-    def update_status(self, text):
-        """Update status text"""
-        config.status = text
-        self.status_text.set_text(text)
-        self.fig.canvas.draw_idle()
-
-    def update_progress(self, progress):
-        """Update progress bar"""
-        self.progress_bar.set_width(progress / 100.0)
-        self.update_status(f"Processing... {progress:.1f}%")
-        self.fig.canvas.draw_idle()
-
-    def on_load_images(self, event):
-        """Load image sequence"""
-        root = tk.Tk()
-        root.withdraw()
-        folder = filedialog.askdirectory(title="Select Image Folder")
-        root.destroy()
-
-        if folder:
-            try:
-                self.update_status(f"Loading image sequence: {os.path.basename(folder)}")
-                h, w = self.reconstructor.load_image_sequence(folder)
-
-                # Display reference image
-                ref_img = self.reconstructor.ref_img
-                self.ax_original.imshow(ref_img.numpy(), cmap='gray')
-                self.ax_original.axis('off')
-
-                # Display ROI region
-                roi_img = self.reconstructor.data_processor.crop_image(ref_img, config.roi)
-                self.ax_roi.imshow(roi_img.numpy(), cmap='gray')
-                self.ax_roi.axis('off')
-
-                self.fig.canvas.draw_idle()
-                self.update_status(f"Loaded {len(self.reconstructor.img_files)} frames, size: {w}x{h}")
-            except Exception as e:
-                self.update_status(f"Loading failed: {str(e)}")
-                print(f"Loading error: {e}")
-
-    def on_select_roi(self, event):
-        """Select ROI region"""
-        if self.reconstructor.ref_img is None:
-            self.update_status("Please load image sequence first")
+    def ccldisplacement_callback(self):
+        if self.targetRegion['imgCrop'] is None:
+            self.log_info("请先选择ROI (步骤 2)。")
+            return
+        if not self.imgfile_paths:
+            self.log_info("请先选取文件夹 (步骤 1)。")
+            return
+        try:
+            frameIndex = int(self.referframe_entry.get())
+        except ValueError:
+            self.log_info("参考帧输入无效。")
             return
 
-        self.update_status("Drag mouse on original image to select ROI, press Enter to confirm")
+        imgCrop = self.targetRegion['imgCrop']
+        self.log_info("正在计算各帧之间的相关性及其位移间隔...")
+        start_time = time.time()
 
-        # Display original image
-        ref_img = self.reconstructor.ref_img
-        self.ax_original.imshow(ref_img.numpy(), cmap='gray')
-        self.ax_original.axis('on')
-        self.fig.canvas.draw_idle()
+        ccrResult_list = []
+        try:
+            imgRef = imread_tif(self.imgfile_paths[frameIndex - 1])
+            imgRef_cropped = imcrop_np(imgRef, imgCrop)
+        except IndexError:
+            self.log_info("错误：参考帧索引超出文件范围。")
+            return
 
-        # Create ROI selector
-        def on_roi_select(eclick, erelease):
-            x1, y1 = int(eclick.xdata), int(eclick.ydata)
-            x2, y2 = int(erelease.xdata), int(erelease.ydata)
-            config.roi = [x1, y1, x2 - x1, y2 - y1]
+        if imgRef_cropped.size == 0 or imgRef is None:
+            self.log_info("错误：参考图像读取或裁剪失败，请检查ROI和文件。")
+            return
 
-            # Display selected ROI
-            roi_img = self.reconstructor.data_processor.crop_image(ref_img, config.roi)
-            self.ax_roi.imshow(roi_img.numpy(), cmap='gray')
-            self.ax_roi.axis('off')
+        for i, file_path in enumerate(self.imgfile_paths):
+            imgTemp = imread_tif(file_path)
+            if imgTemp is None: continue
+            ccrResult = CCR_NC2(imgRef_cropped, imgTemp)
+            ccrResult_list.append(ccrResult)
 
-            self.update_status(f"ROI selected: x={x1}, y={y1}, w={x2 - x1}, h={y2 - y1}")
+        ccrResult = np.array(ccrResult_list)
 
-        self.roi_selector = RectangleSelector(
-            self.ax_original, on_roi_select,
-            drawtype='box', useblit=True,
-            button=[1], minspanx=5, minspany=5,
-            spancoords='pixels', interactive=True
-        )
+        self.log_info("完成各帧之间的相关性及其位移间隔计算。")
 
-    def on_calc_displacement(self, event):
-        """Calculate inter-frame displacements"""
-        if self.reconstructor.img_array is None:
-            self.update_status("Please load image sequence first")
+        frameResult = self.getTargetArray(ccrResult, frameIndex)
+        if frameResult is None:
+            self.log_info("未能成功筛选出满足条件的图像帧，请尝试重新选择ROI或检查数据。")
+            return
+
+        self.LR = frameResult['lrImg']
+        self.imgArray = frameResult['imgArray']
+        self.indexArray = frameResult['indexArray']
+
+        picnum = len(self.imgfile_paths)
+        N = self.imgArray.shape[2]
+
+        self.log_info(f"已经从 {picnum} 张图片中选出 {N} 张，并给出他们的相对位移矩阵")
+        self.log_info(f"计算相关并选择帧运行的时间为: {time.time() - start_time:.2f} 秒")
+        self.update_image_display(self.LR, title1="选择区域原图", title2="HR 结果")
+
+    def psi_callback(self):
+        if self.imgArray is None or self.QE is None:
+            self.log_info("请先完成文件夹选择(1)、ROI选择(2)和位移计算(3)，并确保QE数据已加载。")
             return
 
         try:
-            self.update_status("Calculating inter-frame displacements...")
-            self.reconstructor.index_array = self.reconstructor.displacement_calc.calculate_all_displacements(
-                self.reconstructor.img_array, config.ref_frame_idx
-            )
+            start_time = time.time()
 
-            # Visualize displacements
-            displacements = self.reconstructor.index_array.numpy()
-            self.ax_displacement.clear()
-            self.ax_displacement.plot(displacements[:, 0], label='X displacement')
-            self.ax_displacement.plot(displacements[:, 1], label='Y displacement')
-            self.ax_displacement.legend()
-            self.ax_displacement.grid(True)
-            self.ax_displacement.set_title("Inter-frame Displacement")
+            srFactor_4 = 4
+            srFactor_3 = 3
+            srFactor_2 = 2
 
-            self.fig.canvas.draw_idle()
-            self.update_status(f"Displacement calculation completed, {len(displacements)} frames total")
+            use_start = int(self.usestart_entry.get())
+            use_end = int(self.useend_entry.get())
+
+            N_gen = int(self.ea_gen_entry.get())
+            N_pop = int(self.ea_pop_entry.get())
+            F_ea = float(self.ea_F_entry.get())
+            CR_ea = float(self.ea_CR_entry.get())
+
+            bh_niter = int(self.bh_niter_entry.get())
+            bh_temp = float(self.bh_temp_entry.get())
+
+            if N_pop < 4: N_pop = 4
+            if N_gen < 1: N_gen = 1
+            if F_ea <= 0 or F_ea >= 2: F_ea = 0.5
+            if CR_ea < 0 or CR_ea > 1: CR_ea = 0.9
+            if bh_niter < 1: bh_niter = 1
+            if bh_temp <= 0: bh_temp = 10.0
+
+            qe_key = self.qe_number.get()
+            global QE_DATA
+            QE = QE_DATA.get(qe_key)
+            if QE is None:
+                self.log_info(f"错误：未找到QE版本 {qe_key}。请检查 {QE_FILE_PATH} 中的键名。")
+                return
+
+            QE_rows, QE_cols = QE.shape
+            start_idx = use_start - 1
+            end_idx = min(use_end, self.imgArray.shape[2])
+
+            imgArray_sub = self.imgArray[:, :, start_idx: end_idx]
+            indexArray_sub = self.indexArray[start_idx: end_idx, :]
+            N = imgArray_sub.shape[2]
+
+            if N < 2:
+                self.log_info(f"错误：用于重构的帧数太少 ({N} 帧)，请调整起始/结束帧。")
+                return
+
+            high, width = imgArray_sub.shape[0], imgArray_sub.shape[1]
+
+            # PSI 像素分割成像重构 4x4 (HR4)
+
+            srFactor = srFactor_4
+            bs = srFactor ** 2
+            HR_high, HR_width = high * srFactor, width * srFactor
+            HR4_result_current = np.zeros((HR_high, HR_width))
+
+            lzxl4bs_4 = np.zeros((N, HR_high, HR_width))
+            for num in range(N):
+                ix = indexArray_sub[num, :].astype(np.int32)
+                ymin_idx = srFactor * (ix[1] - 1)
+                ymax_idx = srFactor * (ix[1] - 1 + ix[3])
+                xmin_idx = srFactor * (ix[0] - 1)
+                xmax_idx = srFactor * (ix[0] - 1 + ix[2])
+
+                ymin_clip = max(0, ymin_idx)
+                ymax_clip = min(QE_rows, ymax_idx)
+                xmin_clip = max(0, xmin_idx)
+                xmax_clip = min(QE_cols, xmax_idx)
+
+                qe_crop_h = QE[ymin_clip:ymax_clip, xmin_clip:xmax_clip]
+
+                if qe_crop_h.shape == (HR_high, HR_width):
+                    lzxl4bs_4[num, :, :] = qe_crop_h
+                else:
+                    try:
+                        qe_resized = resize(qe_crop_h, (HR_high, HR_width), order=1, anti_aliasing=True)
+                        lzxl4bs_4[num, :, :] = qe_resized
+                    except Exception:
+                        lzxl4bs_4[num, :, :] = 1.0
+
+            ydatacr4s_4 = np.zeros((N, HR_high, HR_width))
+            for num in range(N):
+                ydatacr4s_4[num, :, :] = rescale(imgArray_sub[:, :, num], scale=srFactor, order=0, anti_aliasing=False)
+
+            wybjA4r_4 = np.zeros((HR_high, HR_width))
+            for r in range(HR_high):
+                for c in range(HR_width):
+                    A4 = ydatacr4s_4[:, r, c]
+                    if N >= 3:
+                        wybjA4r_4[r, c] = (np.sum(A4) - np.max(A4) - np.min(A4)) / (N - 2)
+                    elif N == 2:
+                        wybjA4r_4[r, c] = np.mean(A4)
+                    else:
+                        wybjA4r_4[r, c] = A4[0] if N > 0 else 0
+
+            self.update_image_display(self.LR, HR4_result_current, title1="处理前原图 (LR)", title2="4x4 倍标校像素分割成像处理中...")
+            self.canvas.draw_idle()
+
+            self.log_info("开始 PSI 像素分割成像拟合 4x4...")
+
+            flag_val_4, erf_val_4 = -1, np.inf
+
+            for n in range(high):
+                for m in range(width):
+                    I_4 = imgArray_sub[n, m, :] * bs
+                    hr_y_start = srFactor * n
+                    hr_x_start = srFactor * m
+                    xl4b_4 = lzxl4bs_4[:, hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor].reshape(N,
+                                                                                                                      bs)
+                    qs1_4 = wybjA4r_4[hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor].flatten()
+
+                    if not np.all(np.isfinite(xl4b_4)):
+                        R_4 = qs1_4
+                    else:
+                        try:
+                            R_4, flag_4, res_norm_4 = evolutionary_algorithm_solve_bh4(
+                                xl4b_4, I_4, qs1_4, N_pop, N_gen, F_ea, CR_ea, bh_niter, bh_temp
+                            )
+
+                            flag_val_4 = flag_4
+                            erf_val_4 = res_norm_4
+                        except Exception:
+                            R_4 = qs1_4
+
+                    HR4_block = np.clip(R_4.reshape(srFactor, srFactor), a_min=0, a_max=None)
+                    HR4_result_current[hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor] = HR4_block
+
+                if n % 10 == 0 or n == high - 1:
+                    self.canvas.draw_idle()
+
+            self.HR4 = HR4_result_current
+            self.log_info(f"===== PSI 像素分割成像 4x4 成功完成 ! =====")
+            #self.log_info(f"最后拟合结果 (4x4): 最佳残差平方和={erf_val_4:.2e}")
+
+            # PSI 像素分割成像重构 3x3 逻辑
+
+            srFactor = srFactor_3
+            bs = srFactor ** 2
+            HR_high_3, HR_width_3 = high * srFactor, width * srFactor
+            HR3_result_temp = np.zeros((HR_high_3, HR_width_3))
+
+            lzxl4bs_3 = np.zeros((N, HR_high_3, HR_width_3))
+            for num in range(N):
+                ix = indexArray_sub[num, :].astype(np.int32)
+                ymin_idx = srFactor * (ix[1] - 1)
+                ymax_idx = srFactor * (ix[1] - 1 + ix[3])
+                xmin_idx = srFactor * (ix[0] - 1)
+                xmax_idx = srFactor * (ix[0] - 1 + ix[2])
+
+                ymin_clip = max(0, ymin_idx)
+                ymax_clip = min(QE_rows, ymax_idx)
+                xmin_clip = max(0, xmin_idx)
+                xmax_clip = min(QE_cols, xmax_clip)
+
+                qe_crop_h_3 = QE[ymin_clip:ymax_clip, xmin_clip:xmax_clip]
+
+                if qe_crop_h_3.shape == (HR_high_3, HR_width_3):
+                    lzxl4bs_3[num, :, :] = qe_crop_h_3
+                else:
+                    try:
+                        qe_resized_3 = resize(qe_crop_h_3, (HR_high_3, HR_width_3), order=1, anti_aliasing=True)
+                        lzxl4bs_3[num, :, :] = qe_resized_3
+                    except Exception:
+                        lzxl4bs_3[num, :, :] = 1.0
+
+            ydatacr4s_3 = np.zeros((N, HR_high_3, HR_width_3))
+            for num in range(N):
+                ydatacr4s_3[num, :, :] = rescale(imgArray_sub[:, :, num], scale=srFactor, order=0, anti_aliasing=False)
+
+            wybjA4r_3 = np.zeros((HR_high_3, HR_width_3))
+            for r in range(HR_high_3):
+                for c in range(HR_width_3):
+                    A3 = ydatacr4s_3[:, r, c]
+                    if N >= 3:
+                        wybjA4r_3[r, c] = (np.sum(A3) - np.max(A3) - np.min(A3)) / (N - 2)
+                    elif N == 2:
+                        wybjA4r_3[r, c] = np.mean(A3)
+                    else:
+                        wybjA4r_3[r, c] = A3[0] if N > 0 else 0
+
+            # 模拟执行，但不保存到 self.HR3
+            for n_3 in range(high):
+                for m_3 in range(width):
+                    I_3 = imgArray_sub[n_3, m_3, :] * bs
+                    hr_y_start = srFactor * n_3
+                    hr_x_start = srFactor * m_3
+                    xl4b_3 = lzxl4bs_3[:, hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor].reshape(N,
+                                                                                                                      bs)
+                    qs1_3 = wybjA4r_3[hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor].flatten()
+
+                    if not np.all(np.isfinite(xl4b_3)):
+                        R_3 = qs1_3
+                    else:
+                        try:
+                            R_3, flag_3, res_norm_3 = evolutionary_algorithm_solve_bh3(
+                                xl4b_3, I_3, qs1_3, N_pop, N_gen, F_ea, CR_ea, bh_niter, bh_temp
+                            )
+                        except Exception:
+                            R_3 = qs1_3
+
+                    HR3_block = np.clip(R_3.reshape(srFactor, srFactor), a_min=0, a_max=None)
+                    HR3_result_temp[hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor] = HR3_block
+
+            self.HR3 = HR3_result_temp
+           # self.log_info(f"PSI 像素分割成像 3x3 已处理。")
+
+            # PSI 像素分割成像重构 2x2
+
+            srFactor = srFactor_2
+            bs = srFactor ** 2
+            HR_high_2, HR_width_2 = high * srFactor, width * srFactor
+            HR2_result_temp = np.zeros((HR_high_2, HR_width_2))
+
+            lzxl4bs_2 = np.zeros((N, HR_high_2, HR_width_2))
+            for num in range(N):
+                ix = indexArray_sub[num, :].astype(np.int32)
+                ymin_idx = srFactor * (ix[1] - 1)
+                ymax_idx = srFactor * (ix[1] - 1 + ix[3])
+                xmin_idx = srFactor * (ix[0] - 1)
+                xmax_idx = srFactor * (ix[0] - 1 + ix[2])
+
+                ymin_clip = max(0, ymin_idx)
+                ymax_clip = min(QE_rows, ymax_idx)
+                xmin_clip = max(0, xmin_idx)
+                xmax_clip = min(QE_cols, xmax_clip)
+
+                qe_crop_h_2 = QE[ymin_clip:ymax_clip, xmin_clip:xmax_clip]
+
+                if qe_crop_h_2.shape == (HR_high_2, HR_width_2):
+                    lzxl4bs_2[num, :, :] = qe_crop_h_2
+                else:
+                    try:
+                        qe_resized_2 = resize(qe_crop_h_2, (HR_high_2, HR_width_2), order=1, anti_aliasing=True)
+                        lzxl4bs_2[num, :, :] = qe_resized_2
+                    except Exception:
+                        lzxl4bs_2[num, :, :] = 1.0
+
+            ydatacr4s_2 = np.zeros((N, HR_high_2, HR_width_2))
+            for num in range(N):
+                ydatacr4s_2[num, :, :] = rescale(imgArray_sub[:, :, num], scale=srFactor, order=0, anti_aliasing=False)
+
+            wybjA4r_2 = np.zeros((HR_high_2, HR_width_2))
+            for r in range(HR_high_2):
+                for c in range(HR_width_2):
+                    A2 = ydatacr4s_2[:, r, c]
+                    if N >= 3:
+                        wybjA4r_2[r, c] = (np.sum(A2) - np.max(A2) - np.min(A2)) / (N - 2)
+                    elif N == 2:
+                        wybjA4r_2[r, c] = np.mean(A2)
+                    else:
+                        wybjA4r_2[r, c] = A2[0] if N > 0 else 0
+
+            # 模拟执行，但不保存到 self.HR2
+            for n_2 in range(high):
+                for m_2 in range(width):
+                    I_2 = imgArray_sub[n_2, m_2, :] * bs
+                    hr_y_start = srFactor * n_2
+                    hr_x_start = srFactor * m_2
+                    xl4b_2 = lzxl4bs_2[:, hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor].reshape(N,
+                                                                                                                      bs)
+                    qs1_2 = wybjA4r_2[hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor].flatten()
+
+                    if not np.all(np.isfinite(xl4b_2)):
+                        R_2 = qs1_2
+                    else:
+                        try:
+                            R_2, flag_2, res_norm_2 = evolutionary_algorithm_solve_bh2(
+                                xl4b_2, I_2, qs1_2, N_pop, N_gen, F_ea, CR_ea, bh_niter, bh_temp
+                            )
+                        except Exception:
+                            R_2 = qs1_2
+
+                    HR2_block = np.clip(R_2.reshape(srFactor, srFactor), a_min=0, a_max=None)
+                    HR2_result_temp[hr_y_start:hr_y_start + srFactor, hr_x_start:hr_x_start + srFactor] = HR2_block
+
+            self.HR2 = HR2_result_temp  # 实际不使用，但为了代码完整性保存
+            #self.log_info(f"PSI 像素分割成像 2x2 已处理。")
+
+            end_time = time.time()
+            self.log_info(f"总运行时间: {end_time - start_time:.2f} 秒")
+
+            self.update_image_display(self.LR, self.HR4, title1="处理前原图 (LR)", title2="去除异常解后的像素分割成像图 (EA, 4x4)")
+
         except Exception as e:
-            self.update_status(f"Displacement calculation failed: {str(e)}")
-            print(f"Displacement error: {e}")
+            self.log_info(f"致命错误：PSI 像素分割重构过程中发生未知错误：{e}")
+            messagebox.showerror("PSI 像素分割重构错误", f"程序运行中断，请检查数据和QE文件。\n错误信息: {e}")
 
-    def on_start_reconstruction(self, event):
-        """Start PSI reconstruction"""
-        if self.reconstructor.img_array is None:
-            self.update_status("Please load image sequence first")
+    def save_pictures_callback(self):
+        if self.HR4 is None:
+            self.log_info("HR4 图像未生成。")
             return
 
-        try:
-            self.update_status("Starting PSI reconstruction...")
-            self.progress_bar.set_width(0)
+        path_hr4 = filedialog.asksaveasfilename(defaultextension=".tif",
+                                                filetypes=[("TIF files", "*.tif")],
+                                                title="保存像素分割成像图片 HR4")
+        if path_hr4:
+            hr4_uint16 = np.clip(np.round(self.HR4), a_min=0, a_max=65535).astype(np.uint16)
+            Image.fromarray(hr4_uint16).save(path_hr4)
+            self.log_info(f"HR4 图像已保存至: {path_hr4}")
 
-            # Define progress callback function
-            def progress_callback(progress):
-                self.update_progress(progress)
+        if self.LR is not None:
+            path_lr = filedialog.asksaveasfilename(defaultextension=".tif",
+                                                   filetypes=[("TIF files", "*.tif")],
+                                                   title="保存对应的选择区域图片 LR")
+            if path_lr:
+                lr_uint16 = np.clip(np.round(self.LR), a_min=0, a_max=65535).astype(np.uint16)
+                Image.fromarray(lr_uint16).save(path_lr)
+                self.log_info(f"LR 图像已保存至: {path_lr}")
 
-            # Execute reconstruction
-            result = self.reconstructor.run_reconstruction(progress_callback)
-
-            if result is not None:
-                # Display reconstruction result
-                self.ax_result.clear()
-                self.ax_result.imshow(result.numpy(), cmap='gray')
-                self.ax_result.axis('off')
-                self.ax_result.set_title("PSI Reconstruction Result")
-                self.fig.canvas.draw_idle()
-
-                self.update_progress(100)
-                self.update_status(
-                    f"PSI reconstruction completed! Processing time: {config.processing_time:.2f}s, "
-                    f"Result size: {result.shape[1]}x{result.shape[0]}"
-                )
-        except Exception as e:
-            self.update_status(f"Reconstruction failed: {str(e)}")
-            print(f"Reconstruction error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def on_save_result(self, event):
-        """Save reconstruction result"""
-        if self.reconstructor.psi_result is None:
-            self.update_status("Please complete reconstruction first")
+    def draw_contrast_callback(self):
+        if self.HR4 is None or self.LR is None:
+            self.log_info("HR4 或 LR 图像未生成。")
             return
 
-        root = tk.Tk()
-        root.withdraw()
-        save_path = filedialog.asksaveasfilename(
-            defaultextension=".tif",
-            filetypes=[("TIFF files", "*.tif"), ("PNG files", "*.png"), ("JPEG files", "*.jpg"), ("All files", "*.*")],
-            title="Save Reconstruction Result"
-        )
-        root.destroy()
+        plt.ion()
+        fig_crop, axes_crop = plt.subplots(1, 2)
+        axes_crop[0].imshow(self.LR, cmap='gray')
+        axes_crop[0].set_title('LR 图像')
+        axes_crop[1].imshow(self.HR4, cmap='gray')
+        axes_crop[1].set_title('HR4 像素分割成像图')
+        fig_crop.suptitle("请在新弹出的图窗上选择 ROI 进行对比度计算 (双击确认)")
 
-        if save_path:
-            success = self.reconstructor.data_processor.save_image(
-                self.reconstructor.psi_result, save_path
-            )
-            if success:
-                self.update_status(f"Result saved to: {save_path}")
-            else:
-                self.update_status("Saving failed")
+        self.contrast_roi = None
 
-    def run(self):
-        """Run GUI"""
-        plt.show()
+        def on_select_contrast(eclick, erelease):
+            x1, y1 = eclick.xdata, eclick.ydata
+            x2, y2 = erelease.xdata, erelease.ydata
+            self.contrast_roi = [min(x1, x2), min(y1, y2), abs(x1 - x2), abs(y1 - y2)]
+
+        def on_double_click_contrast(event):
+            if event.inaxes == axes_crop[0] and self.contrast_roi:
+                x, y, w, h = [int(np.round(val)) for val in self.contrast_roi]
+                A = self.LR[y: y + h, x: x + w].copy()
+
+                srFactor = self.targetRegion['srFactor']
+                HR4C = self.HR4[y * srFactor: y * srFactor + h * srFactor,
+                       x * srFactor: x * srFactor + w * srFactor].copy()
+
+                if A.size == 0 or HR4C.size == 0:
+                    self.log_info("裁剪区域无效。")
+                    plt.ioff()
+                    plt.close(fig_crop)
+                    return
+
+                A = gaussian(A, sigma=0.4)
+
+                ctrA = (np.max(A) - np.min(A)) / (np.max(A) + np.min(A) + 1e-6)
+                ctrB = (np.max(HR4C) - np.min(HR4C)) / (np.max(HR4C) + np.min(HR4C) + 1e-6)
+
+                plt.close(fig_crop)
+
+                fig_result, axes_result = plt.subplots(1, 2)
+                axes_result[0].imshow(A, cmap='gray')
+                axes_result[0].set_title(f"原图像对比度: {ctrA:.4f}")
+                axes_result[1].imshow(HR4C, cmap='gray')
+                axes_result[1].set_title(f"像素分割成像对比度: {ctrB:.4f}")
+
+                if ctrA > 1e-6:
+                    mtf_improvement = (ctrB - ctrA) / ctrA
+                else:
+                    mtf_improvement = 0.0
+
+                self.log_info(f"LR 对比度: {ctrA:.4f}, HR 对比度: {ctrB:.4f}, MTF 提升: {mtf_improvement:.2%}")
+
+                axes_result[1].text(0, HR4C.shape[0] * 1.05, f"MTF 提升: {mtf_improvement:.2%}",
+                                    transform=axes_result[1].transAxes)
+                fig_result.tight_layout()
+                plt.show(block=False)
+                plt.ioff()
+
+            elif event.inaxes and event.dblclick:
+                self.log_info("请在 LR 图像 (左图) 上选择 ROI。")
+
+        rs = RectangleSelector(axes_crop[0], on_select_contrast,
+                               drawtype='box', useblit=True,
+                               button=[1],
+                               spancoords='data', interactive=True)
+
+        fig_crop.canvas.mpl_connect('button_press_event',
+                                    lambda event: on_double_click_contrast(event) if event.dblclick else None)
+        plt.show(block=True)
+        plt.ioff()
 
 
-# -------------------------- Main Program Entry --------------------------
-if __name__ == "__main__":
-    print("Pixel-segmenting Imaging (PSI) System starting...")
-    print(f"PyTorch version: {torch.__version__}")
-
-    warnings.filterwarnings('ignore')
-
-    gui = PSIGUI()
-    gui.run()
+if __name__ == '__main__':
+    app = JCAPP1_Python()
+    app.mainloop()
