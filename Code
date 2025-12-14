@@ -20,7 +20,7 @@ from tkinter import messagebox
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-QE_FILE_PATH = r'D\QE.npz'
+QE_FILE_PATH = r'D\QE Distribution Data.npz'
 QE_DATA = None
 
 
