@@ -10,7 +10,7 @@ Regarding the attached demo code, we provide the following notes:
 
 4. The demo code can directly reconstruct images with obvious visual improvements from original images. 
 
-5. All actual before-and-after enhancement images in this paper are stored in the Results folder.
+5. All actual before-and-after enhancement images in this paper are stored in the Result folder.
 
 If you want to verify better reconstruction effects:
 
